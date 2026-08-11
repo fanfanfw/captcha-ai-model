@@ -1,0 +1,32 @@
+[project]
+name = "captcha-ai-model"
+version = "0.1.0"
+description = "Local CAPTCHA inference API"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "fastapi==0.129.0",
+    "pillow==11.3.0",
+    "python-multipart==0.0.20",
+    "torch==2.4.0",
+    "transformers==4.37.2",
+    "uvicorn[standard]==0.41.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx==0.28.1",
+    "pytest==9.0.2",
+    "ruff==0.14.8",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+include = ["app/**/*.py", "tests/**/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
