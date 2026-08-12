@@ -5,10 +5,11 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, Security, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from PIL import Image, UnidentifiedImageError
 
 from app.control_plane import ControlPlane, ControlPlaneError
@@ -17,6 +18,11 @@ from app.model import model_service
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 ALLOWED_TYPES = {"image/jpeg", "image/png"}
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+API_KEY_HEADER = APIKeyHeader(
+    name="x-api-key",
+    auto_error=False,
+    description="Managed API key issued by the API Key Management dashboard.",
+)
 
 
 def error(status_code: int, code: str, message: str) -> HTTPException:
@@ -100,18 +106,20 @@ def create_app(control_plane: ControlPlane | None = None) -> FastAPI:
         return response(503, {"status": "unavailable"})
 
     @application.post("/predict")
-    async def predict(request: Request, file: UploadFile = File(...)) -> dict[str, str]:
-        authorization = request.headers.get("Authorization")
-        if authorization is None or not authorization.startswith("Bearer "):
-            raise error(401, "unauthorized", "Bearer API key wajib diisi.")
-        raw_key = authorization[7:]
+    async def predict(
+        request: Request,
+        file: UploadFile = File(...),
+        raw_key: str | None = Security(API_KEY_HEADER),
+    ) -> dict[str, str]:
+        if raw_key is None:
+            raise error(401, "unauthorized", "x-api-key wajib diisi.")
         if (
             not 8 <= len(raw_key) <= 512
             or raw_key.strip() != raw_key
             or " " in raw_key
             or not raw_key.isascii()
         ):
-            raise error(401, "unauthorized", "Bearer API key tidak valid.")
+            raise error(401, "unauthorized", "x-api-key tidak valid.")
         try:
             access = await application.state.control_plane.introspect(
                 raw_key, request.state.request_id

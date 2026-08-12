@@ -1,0 +1,23 @@
+[Unit]
+Description=Captcha AI Model API
+Wants=network-online.target api-key-management.service
+After=network-online.target api-key-management.service
+
+[Service]
+Type=simple
+User=ifcon
+Group=ifcon
+WorkingDirectory=/home/ifcon/ff/capctha-ai-model
+EnvironmentFile=/home/ifcon/ff/capctha-ai-model/.env
+ExecStart=/home/ifcon/ff/capctha-ai-model/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 18200
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

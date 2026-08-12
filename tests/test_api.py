@@ -86,17 +86,25 @@ def test_invalid_request_id_is_replaced(service):
     int(response.headers["x-request-id"], 16)
 
 
+def test_openapi_declares_x_api_key(service):
+    schema = service[0].get("/openapi.json").json()
+    scheme = schema["components"]["securitySchemes"]["APIKeyHeader"]
+    assert scheme["type"] == "apiKey"
+    assert scheme["in"] == "header"
+    assert scheme["name"] == "x-api-key"
+    assert schema["paths"]["/predict"]["post"]["security"] == [{"APIKeyHeader": []}]
+
+
 @pytest.mark.parametrize(
     "headers",
     [
         {},
-        {"Authorization": "Basic key"},
-        {"Authorization": "Bearer "},
-        {"Authorization": "Bearer bad key"},
-        {"x-api-key": "user-key"},
+        {"Authorization": "Bearer user-key"},
+        {"x-api-key": ""},
+        {"x-api-key": "bad key"},
     ],
 )
-def test_missing_or_malformed_bearer_rejected(service, headers):
+def test_missing_or_malformed_x_api_key_rejected(service, headers):
     response = post(service[0], headers)
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "unauthorized"
@@ -106,7 +114,7 @@ def test_missing_or_malformed_bearer_rejected(service, headers):
 def test_inactive_is_public_401(service):
     service[3].clear()
     service[3].update({"active": False, "cache_ttl_seconds": 0})
-    response = post(service[0], {"Authorization": "Bearer user-key"})
+    response = post(service[0], {"x-api-key": "user-key"})
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "unauthorized"
 
@@ -116,7 +124,7 @@ def test_valid_inference_contract_and_usage(service):
     introspection["future_field"] = {"accepted": True}
     response = post(
         client,
-        {"Authorization": "Bearer user-key", "X-Request-ID": "request-1"},
+        {"x-api-key": "user-key", "X-Request-ID": "request-1"},
     )
     assert response.status_code == 200
     assert response.json() == {"prediction": "ABCDE"}
@@ -144,7 +152,7 @@ def test_valid_inference_contract_and_usage(service):
 
 def test_positive_cache_skips_second_introspection(service):
     client, _, requests, _, _ = service
-    headers = {"Authorization": "Bearer same-key"}
+    headers = {"x-api-key": "same-key"}
     assert post(client, headers).status_code == 200
     assert post(client, headers).status_code == 200
     assert sum(request.url.path.endswith("/introspect") for request in requests) == 1
@@ -164,7 +172,7 @@ def test_positive_cache_skips_second_introspection(service):
 )
 def test_malformed_known_fields_fail_closed(service, change):
     service[3].update(change)
-    response = post(service[0], {"Authorization": "Bearer user-key"})
+    response = post(service[0], {"x-api-key": "user-key"})
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "authorization_unavailable"
 
@@ -173,7 +181,7 @@ def test_expired_response_fails_closed(service):
     service[3]["expires_at"] = (
         datetime.now(timezone.utc) - timedelta(seconds=1)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    assert post(service[0], {"Authorization": "Bearer user-key"}).status_code == 503
+    assert post(service[0], {"x-api-key": "user-key"}).status_code == 503
 
 
 def test_timeout_fails_closed(service):
@@ -184,13 +192,13 @@ def test_timeout_fails_closed(service):
         raise httpx.ReadTimeout("timeout")
 
     service[1].client.post = timeout
-    response = post(service[0], {"Authorization": "Bearer user-key"})
+    response = post(service[0], {"x-api-key": "user-key"})
     assert response.status_code == 503
 
 
 def test_rate_limit_and_retry_after(service):
     service[3]["rate_limits"] = {"predict": {"requests": 1, "window_seconds": 60}}
-    headers = {"Authorization": "Bearer limited-key"}
+    headers = {"x-api-key": "limited-key"}
     assert post(service[0], headers).status_code == 200
     response = post(service[0], headers)
     assert response.status_code == 429
@@ -200,13 +208,13 @@ def test_rate_limit_and_retry_after(service):
 
 def test_zero_requests_denies(service):
     service[3]["rate_limits"] = {"predict": {"requests": 0, "window_seconds": 60}}
-    assert post(service[0], {"Authorization": "Bearer denied-key"}).status_code == 429
+    assert post(service[0], {"x-api-key": "denied-key"}).status_code == 429
 
 
 def test_usage_retries_stable_payload(service):
     client, control, requests, _, statuses = service
     statuses[:] = [503, 202]
-    headers = {"Authorization": "Bearer usage-key"}
+    headers = {"x-api-key": "usage-key"}
     assert post(client, headers).status_code == 200
     first = [request for request in requests if request.url.path.endswith("/batches")][
         0
