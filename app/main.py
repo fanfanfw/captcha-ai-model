@@ -21,7 +21,6 @@ REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 API_KEY_HEADER = APIKeyHeader(
     name="x-api-key",
     auto_error=False,
-    description="Managed API key issued by the API Key Management dashboard.",
 )
 
 
