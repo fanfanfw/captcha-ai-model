@@ -40,6 +40,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "pillow" },
     { name = "python-multipart" },
     { name = "torch" },
@@ -49,7 +50,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -57,6 +57,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = "==0.129.0" },
+    { name = "httpx", specifier = "==0.28.1" },
     { name = "pillow", specifier = "==11.3.0" },
     { name = "python-multipart", specifier = "==0.0.20" },
     { name = "torch", specifier = "==2.4.0" },
@@ -66,7 +67,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = "==0.28.1" },
     { name = "pytest", specifier = "==9.0.2" },
     { name = "ruff", specifier = "==0.14.8" },
 ]

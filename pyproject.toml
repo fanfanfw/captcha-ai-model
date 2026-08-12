@@ -5,6 +5,7 @@ description = "Local CAPTCHA inference API"
 requires-python = ">=3.10,<3.11"
 dependencies = [
     "fastapi==0.129.0",
+    "httpx==0.28.1",
     "pillow==11.3.0",
     "python-multipart==0.0.20",
     "torch==2.4.0",
@@ -14,7 +15,6 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "httpx==0.28.1",
     "pytest==9.0.2",
     "ruff==0.14.8",
 ]

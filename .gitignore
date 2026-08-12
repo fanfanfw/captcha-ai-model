@@ -3,3 +3,4 @@ captcha-model/
 *_predictions.csv
 __pycache__/
 *.py[cod]
+.env
