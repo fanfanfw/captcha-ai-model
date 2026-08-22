@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -20,8 +21,13 @@ from app.control_plane import (
     MAX_RESPONSE_BYTES,
     ControlPlane,
     ControlPlaneError,
+    CredentialError,
     KeyAccess,
+    NetworkError,
     RateLimit,
+    RateLimitPolicyMissing,
+    ResponseSchemaError,
+    ResponseStatusError,
     UsageFlushOutcome,
 )
 from app.main import create_app, model_service
@@ -271,12 +277,13 @@ def test_valid_inference_contract_and_usage(service):
     wait_for(lambda: len(requests) == 2)
     inspect_request, usage_request = requests
     assert inspect_request.method == "POST"
-    assert inspect_request.url.path == "/internal/v1/keys/introspect"
+    assert inspect_request.url.path == "/internal/v2/keys/introspect"
     assert inspect_request.headers["authorization"] == f"Bearer {SERVICE_CREDENTIAL}"
     assert inspect_request.headers["x-request-id"] == "request-1"
     assert json.loads(inspect_request.content) == {
         "api_key": "user-key",
-        "required_scope": "captcha:predict",
+        "method": "POST",
+        "endpoint_template": "/predict",
     }
     assert usage_request.method == "POST"
     assert usage_request.url.path == "/internal/v1/usage/batches"
@@ -315,6 +322,21 @@ def test_positive_cache_skips_second_introspection(service):
     assert sum(request.url.path.endswith("/introspect") for request in requests) == 1
 
 
+def test_introspection_cache_isolated_by_route(service):
+    _, control, requests, _, _ = service
+
+    async def scenario():
+        await control.introspect("same-key", "one", "POST", "/predict")
+        await control.introspect("same-key", "two", "GET", "/predict")
+        await control.introspect("same-key", "three", "POST", "/other")
+
+    asyncio.run(scenario())
+    introspections = [
+        request for request in requests if request.url.path.endswith("/introspect")
+    ]
+    assert len(introspections) == 3
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -322,9 +344,12 @@ def test_positive_cache_skips_second_introspection(service):
         {"scopes": ["wrong"]},
         {"expires_at": "bad"},
         {"cache_ttl_seconds": 31},
-        {"rate_limits": {}},
-        {"rate_limits": {"predict": {"requests": 1, "window_seconds": 30}}},
-        {"rate_limits": {"predict": {"requests": 1}}},
+        {"rate_limit": {}},
+        {"rate_limit": {"requests": 1, "window_seconds": 30}},
+        {"rate_limit": {"requests": 1}},
+        {"rate_limit": {"requests": True, "window_seconds": 60}},
+        {"rate_limit": {"requests": 1, "window_seconds": True}},
+        {"rate_limit": {"requests": 10_001, "window_seconds": 60}},
     ],
 )
 def test_malformed_known_fields_fail_closed(service, change):
@@ -355,7 +380,7 @@ def test_timeout_fails_closed(service):
 
 def test_rate_limit_and_retry_after(service):
     service[1].enforcement = True
-    service[3]["rate_limits"] = {"predict": {"requests": 1, "window_seconds": 60}}
+    service[3]["rate_limit"] = {"requests": 1, "window_seconds": 60}
     headers = {"x-api-key": "limited-key"}
     assert post(service[0], headers).status_code == 200
     response = post(service[0], headers)
@@ -366,7 +391,7 @@ def test_rate_limit_and_retry_after(service):
 
 def test_zero_requests_denies(service):
     service[1].enforcement = True
-    service[3]["rate_limits"] = {"predict": {"requests": 0, "window_seconds": 60}}
+    service[3]["rate_limit"] = {"requests": 0, "window_seconds": 60}
     assert post(service[0], {"x-api-key": "denied-key"}).status_code == 429
 
 
@@ -463,6 +488,7 @@ def test_permanent_usage_failure_dead_letters_and_advances(status, caplog):
             "permanent_payload": 1,
             "authentication": 0,
             "permanent_response": 0,
+            "response_schema": 0,
         }
         await control.close()
 
@@ -577,7 +603,7 @@ def test_stream_rejects_oversized_declared_length_without_reading():
             httpx.MockTransport(handler),
         )
         with pytest.raises(ControlPlaneError):
-            await control.introspect(CLIENT_API_KEY, "declared")
+            await control.introspect(CLIENT_API_KEY, "declared", "POST", "/predict")
         await control.close()
 
     asyncio.run(scenario())
@@ -599,7 +625,7 @@ def test_stream_stops_when_chunked_body_exceeds_limit(caplog):
             httpx.MockTransport(handler),
         )
         with pytest.raises(ControlPlaneError):
-            await control.introspect(CLIENT_API_KEY, "chunked")
+            await control.introspect(CLIENT_API_KEY, "chunked", "POST", "/predict")
         await control.close()
 
     asyncio.run(scenario())
@@ -627,7 +653,10 @@ def test_stream_accepts_body_exactly_at_limit():
             SERVICE_CREDENTIAL,
             httpx.MockTransport(handler),
         )
-        assert await control.introspect(CLIENT_API_KEY, "exact") is None
+        assert (
+            await control.introspect(CLIENT_API_KEY, "exact", "POST", "/predict")
+            is None
+        )
         await control.close()
 
     asyncio.run(scenario())
@@ -648,22 +677,21 @@ def test_malformed_json_fails_closed_without_content_leak(caplog):
             httpx.MockTransport(handler),
         )
         with pytest.raises(ControlPlaneError):
-            await control.introspect(CLIENT_API_KEY, "malformed")
+            await control.introspect(CLIENT_API_KEY, "malformed", "POST", "/predict")
         await control.close()
 
     asyncio.run(scenario())
     assert private_body.decode() not in caplog.text
 
 
-def test_partial_rate_limits_policy_tolerated(service):
-    service[3]["rate_limits"] = {"other": {"requests": 10, "window_seconds": 60}}
+def test_missing_rate_limit_policy_tolerated_when_enforcement_disabled(service):
     response = post(service[0], {"x-api-key": "user-key"})
     assert response.status_code == 200
 
 
 def test_different_keys_have_isolated_buckets(service):
     service[1].enforcement = True
-    service[3]["rate_limits"] = {"predict": {"requests": 2, "window_seconds": 60}}
+    service[3]["rate_limit"] = {"requests": 2, "window_seconds": 60}
     service[3]["_per_key"] = True
     key_a = "key-a-abcdefghijklmnop"
     key_b = "key-b-abcdefghijklmnop"
@@ -695,7 +723,7 @@ def test_bearer_only_client_key_rejected(service):
 
 def test_rate_limiting_before_expensive_work(service, monkeypatch):
     service[1].enforcement = True
-    service[3]["rate_limits"] = {"predict": {"requests": 0, "window_seconds": 60}}
+    service[3]["rate_limit"] = {"requests": 0, "window_seconds": 60}
     invoked = []
 
     def forbidden(*args, **kwargs):
@@ -730,7 +758,7 @@ def test_enforcement_false_uses_safety_limiter():
     assert all(result is None or result >= 1 for result in results)
 
 
-def test_enforcement_true_missing_policy_fails_closed_without_global_charge():
+def test_enforcement_true_missing_policy_fails_closed():
     from app.control_plane import KeyAccess
 
     control = ControlPlane(
@@ -738,8 +766,6 @@ def test_enforcement_true_missing_policy_fails_closed_without_global_charge():
     )
     with pytest.raises(ControlPlaneError):
         control.enforce_rate_limit(KeyAccess(KEY_ID, 30, None))
-    control.enforcement = False
-    assert control.enforce_rate_limit(KeyAccess(KEY_ID, 30, None)) is None
 
 
 def test_zero_and_exhausted_policy_do_not_consume_global_quota():
@@ -824,11 +850,13 @@ def test_introspection_cache_is_bounded_and_prunes_expired_entries(monkeypatch):
             cache_max_entries=3,
         )
         for index in range(10):
-            await control.introspect(f"client-key-{index}", str(index))
+            await control.introspect(
+                f"client-key-{index}", str(index), "POST", "/predict"
+            )
             assert len(control.cache) <= 3
         active_digests = set(control.cache)
         clock[0] += 31
-        await control.introspect("new-client-key", "prune")
+        await control.introspect("new-client-key", "prune", "POST", "/predict")
         assert len(control.cache) == 1
         assert not active_digests & set(control.cache)
         await control.close()
@@ -1549,3 +1577,259 @@ def test_usage_overflow_returns_to_bounded_dimensions():
     assert control.usage_overflow_count == 47
     control.usage.clear()
     assert control.pending_usage_count() == 0
+
+
+def test_enforcement_active_no_policy_raises_rate_limit_policy_missing(caplog):
+    from app.control_plane import KeyAccess
+
+    control = ControlPlane(
+        "https://control.invalid", "s" * 40, enforcement=True, global_limit=1000
+    )
+    with pytest.raises(RateLimitPolicyMissing):
+        control.enforce_rate_limit(KeyAccess(KEY_ID, 30, None))
+
+
+def test_introspect_network_error_returns_network_error():
+    async def scenario():
+        async def handler(request):
+            raise httpx.ConnectError("connection refused")
+
+        control = ControlPlane(
+            "https://control.invalid",
+            SERVICE_CREDENTIAL,
+            httpx.MockTransport(handler),
+        )
+        with pytest.raises(NetworkError):
+            await control.introspect("some-key", "req-1", "POST", "/predict")
+        await control.close()
+
+    asyncio.run(scenario())
+
+
+def test_introspect_non_200_returns_status_error():
+    async def scenario():
+        async def handler(request):
+            return httpx.Response(500, json={"error": "internal"})
+
+        control = ControlPlane(
+            "https://control.invalid",
+            SERVICE_CREDENTIAL,
+            httpx.MockTransport(handler),
+        )
+        with pytest.raises(ResponseStatusError):
+            await control.introspect("some-key", "req-1", "POST", "/predict")
+        await control.close()
+
+    asyncio.run(scenario())
+
+
+def test_introspect_401_returns_credential_error():
+    async def scenario():
+        async def handler(request):
+            return httpx.Response(401, json={"error": "unauthorized"})
+
+        control = ControlPlane(
+            "https://control.invalid",
+            SERVICE_CREDENTIAL,
+            httpx.MockTransport(handler),
+        )
+        with pytest.raises(CredentialError):
+            await control.introspect("some-key", "req-1", "POST", "/predict")
+        await control.close()
+
+    asyncio.run(scenario())
+
+
+def test_introspect_403_returns_credential_error():
+    async def scenario():
+        async def handler(request):
+            return httpx.Response(403, json={"error": "forbidden"})
+
+        control = ControlPlane(
+            "https://control.invalid",
+            SERVICE_CREDENTIAL,
+            httpx.MockTransport(handler),
+        )
+        with pytest.raises(CredentialError):
+            await control.introspect("some-key", "req-1", "POST", "/predict")
+        await control.close()
+
+    asyncio.run(scenario())
+
+
+def test_introspect_malformed_body_returns_schema_error():
+    async def scenario():
+        async def handler(request):
+            return httpx.Response(200, content=b"not-json")
+
+        control = ControlPlane(
+            "https://control.invalid",
+            SERVICE_CREDENTIAL,
+            httpx.MockTransport(handler),
+        )
+        with pytest.raises(ResponseSchemaError):
+            await control.introspect("some-key", "req-1", "POST", "/predict")
+        await control.close()
+
+    asyncio.run(scenario())
+
+
+def test_main_predict_enforcement_no_policy_returns_503(service):
+    client, control, requests, introspection, _ = service
+    control.enforcement = True
+    response = post(client, {"x-api-key": "user-key"})
+    assert response.status_code == 503
+
+
+def test_structured_errors_still_caught_as_control_plane_error():
+    assert isinstance(NetworkError(), ControlPlaneError)
+    assert isinstance(CredentialError(), ControlPlaneError)
+    assert isinstance(ResponseStatusError(), ControlPlaneError)
+    assert isinstance(ResponseSchemaError(), ControlPlaneError)
+    assert isinstance(RateLimitPolicyMissing(), ControlPlaneError)
+
+
+# ---------------------------------------------------------------------------
+# F-003 / F-004: usage payload contract and failure tracking
+# ---------------------------------------------------------------------------
+
+
+def test_usage_payload_matches_control_plane_contract(service):
+    client, _, requests, _, _ = service
+    post(client, {"x-api-key": "user-key", "X-Request-ID": "contract-check"})
+    wait_for(lambda: len(requests) == 2)
+    _, usage_request = requests
+    payload = json.loads(usage_request.content)
+    assert set(payload) == {"batch_id", "records"}
+    uuid.UUID(payload["batch_id"])
+    assert payload["batch_id"] == str(uuid.UUID(payload["batch_id"]))
+    assert 1 <= len(payload["records"]) <= 500
+    record = payload["records"][0]
+    assert set(record) == {
+        "bucket_start",
+        "key_id",
+        "endpoint_template",
+        "method",
+        "status_class",
+        "request_count",
+        "error_count",
+        "latency_sum_ms",
+        "latency_max_ms",
+    }
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00Z", record["bucket_start"])
+    uuid.UUID(record["key_id"])
+    assert record["method"] == "POST"
+    assert record["endpoint_template"] == "/predict"
+    assert record["status_class"] in {"2xx", "3xx", "4xx", "5xx"}
+    assert type(record["request_count"]) is int and record["request_count"] >= 1
+    assert type(record["error_count"]) is int
+    assert 0 <= record["error_count"] <= record["request_count"]
+    assert type(record["latency_sum_ms"]) is int
+    assert record["latency_sum_ms"] >= 0
+    assert type(record["latency_max_ms"]) is int
+    assert 0 <= record["latency_max_ms"] <= record["latency_sum_ms"]
+
+
+def test_response_schema_failure_tracked_in_failure_counts():
+    payloads = []
+
+    async def handler(request):
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json={"unexpected": "schema"})
+
+    async def scenario():
+        control = ControlPlane(
+            "https://control.invalid",
+            SERVICE_CREDENTIAL,
+            httpx.MockTransport(handler),
+            usage_retry_attempts=1,
+            usage_retry_delay_seconds=0.01,
+        )
+        control.record_usage(KEY_ID, 200, 10)
+        outcome = await control.flush_usage("schema")
+        assert outcome is UsageFlushOutcome.TRANSIENT
+        assert control.usage_failure_counts["response_schema"] >= 1
+        assert control.pending_usage_count() == 1
+        await control.close()
+
+    asyncio.run(scenario())
+    assert len(payloads) == 1
+
+
+def test_response_schema_success_retries_and_eventually_accepts():
+    attempts = []
+
+    async def handler(request):
+        attempts.append(json.loads(request.content))
+        if len(attempts) == 1:
+            return httpx.Response(200, json={"unexpected": "schema"})
+        return httpx.Response(202, json={"accepted": True, "duplicate": False})
+
+    async def scenario():
+        control = ControlPlane(
+            "https://control.invalid",
+            SERVICE_CREDENTIAL,
+            httpx.MockTransport(handler),
+            usage_retry_attempts=2,
+            usage_retry_delay_seconds=0.01,
+        )
+        control.record_usage(KEY_ID, 200, 10)
+        outcome = await control.flush_usage("schema_retry")
+        assert outcome is UsageFlushOutcome.ACCEPTED
+        assert len(attempts) == 2
+        assert control.usage_failure_counts["response_schema"] == 1
+        assert control.pending_usage_count() == 0
+        await control.close()
+
+    asyncio.run(scenario())
+
+
+def test_permanent_rejection_logs_safe_record_count(caplog):
+    async def handler(request):
+        return httpx.Response(
+            400,
+            json={"error": {"code": "invalid_request", "message": "invalid"}},
+        )
+
+    async def scenario():
+        control = ControlPlane(
+            "https://control.invalid",
+            SERVICE_CREDENTIAL,
+            httpx.MockTransport(handler),
+        )
+        control._last_drop_log = -100
+        control._last_failure_log = -100
+        control.record_usage(KEY_ID, 200, 10)
+        control.record_usage("00000000-0000-7000-8000-000000000002", 429, 20)
+        outcome = await control.flush_usage("perm_reject")
+        assert outcome is UsageFlushOutcome.DEAD_LETTERED
+        assert control.usage_failure_counts["permanent_payload"] == 1
+        await control.close()
+
+    asyncio.run(scenario())
+    assert "usage batch permanently rejected; records=2" in caplog.text
+    assert KEY_ID not in caplog.text
+    assert SERVICE_CREDENTIAL not in caplog.text
+
+
+def test_usage_failure_counts_includes_response_schema():
+    control = ControlPlane("https://control.invalid", SERVICE_CREDENTIAL)
+    assert "response_schema" in control.usage_failure_counts
+    assert control.usage_failure_counts["response_schema"] == 0
+
+
+def test_usage_payload_endpoint_template_matches_spec():
+    async def scenario():
+        control = ControlPlane(
+            "https://control.invalid",
+            SERVICE_CREDENTIAL,
+        )
+        control.record_usage(KEY_ID, 200, 10)
+        batch = await control.prepare_usage_batch()
+        assert batch is not None
+        record = batch["records"][0]
+        assert record["endpoint_template"] == "/predict"
+        assert record["method"] == "POST"
+        await control.close()
+
+    asyncio.run(scenario())

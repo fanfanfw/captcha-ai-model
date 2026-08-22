@@ -37,7 +37,27 @@ class ControlPlaneError(Exception):
     pass
 
 
-class ResponseTooLarge(ControlPlaneError):
+class NetworkError(ControlPlaneError):
+    """Control plane unreachable or connection/read failure."""
+
+
+class CredentialError(ControlPlaneError):
+    """Control plane rejected our service credential (HTTP 401/403)."""
+
+
+class ResponseStatusError(ControlPlaneError):
+    """Control plane replied with an unexpected HTTP status."""
+
+
+class ResponseSchemaError(ControlPlaneError):
+    """Control plane replied with an unexpected or malformed body."""
+
+
+class RateLimitPolicyMissing(ControlPlaneError):
+    """Enforcement is active but the introspection carries no predict policy."""
+
+
+class ResponseTooLarge(ResponseSchemaError):
     pass
 
 
@@ -65,7 +85,7 @@ class ControlPlane:
     _MAX_BASE_URL_LEN = 500
     _MAX_PATH_LEN = 256
     _MAX_DECODE_DEPTH = 4
-    _INTROSPECT_PATH = "/internal/v1/keys/introspect"
+    _INTROSPECT_PATH = "/internal/v2/keys/introspect"
     _USAGE_PATH = "/internal/v1/usage/batches"
 
     @staticmethod
@@ -246,6 +266,7 @@ class ControlPlane:
             "permanent_payload": 0,
             "authentication": 0,
             "permanent_response": 0,
+            "response_schema": 0,
         }
         self._last_overflow_log = 0.0
         self._last_drop_log = 0.0
@@ -300,7 +321,7 @@ class ControlPlane:
             try:
                 declared_size = int(declared)
             except ValueError as exc:
-                raise ControlPlaneError from exc
+                raise ResponseSchemaError from exc
             if declared_size < 0 or declared_size > MAX_RESPONSE_BYTES:
                 raise ResponseTooLarge
         body = bytearray()
@@ -311,7 +332,7 @@ class ControlPlane:
         try:
             return json.loads(body)
         except (UnicodeDecodeError, ValueError, TypeError) as exc:
-            raise ControlPlaneError from exc
+            raise ResponseSchemaError from exc
 
     def _prune_cache(self, now: float) -> None:
         keys = tuple(self.cache)
@@ -332,8 +353,16 @@ class ControlPlane:
             self.cache.pop(next(iter(self.cache)), None)
         self.cache[digest] = (expires_at, access)
 
-    async def introspect(self, raw_key: str, request_id: str) -> KeyAccess | None:
-        digest = hashlib.sha256(raw_key.encode()).hexdigest()
+    async def introspect(
+        self,
+        raw_key: str,
+        request_id: str,
+        method: str,
+        endpoint_template: str,
+    ) -> KeyAccess | None:
+        digest = hashlib.sha256(
+            b"\0".join((raw_key.encode(), method.encode(), endpoint_template.encode()))
+        ).hexdigest()
         now = time.monotonic()
         self._prune_cache(now)
         cached = self.cache.get(digest)
@@ -345,14 +374,24 @@ class ControlPlane:
                 "POST",
                 f"{self.base_url}{self._INTROSPECT_PATH}",
                 headers=self._headers(request_id),
-                json={"api_key": raw_key, "required_scope": SCOPE},
+                json={
+                    "api_key": raw_key,
+                    "method": method,
+                    "endpoint_template": endpoint_template,
+                },
             ) as response:
                 if response.is_redirect or response.status_code != 200:
-                    raise ControlPlaneError
+                    if response.status_code in (401, 403):
+                        raise CredentialError
+                    raise ResponseStatusError
                 payload = await self._read_json_response(response)
             access = self._validate_introspection(payload, self.cache_max_ttl_seconds)
-        except (httpx.HTTPError, ValueError, TypeError, ControlPlaneError) as exc:
-            raise ControlPlaneError from exc
+        except httpx.HTTPError as exc:
+            raise NetworkError from exc
+        except (ValueError, TypeError) as exc:
+            raise ResponseSchemaError from exc
+        except ControlPlaneError:
+            raise
         if access is None:
             return None
         if access.cache_ttl_seconds:
@@ -364,62 +403,62 @@ class ControlPlane:
         payload: Any, cache_max_ttl: int = 30
     ) -> KeyAccess | None:
         if type(payload) is not dict or type(payload.get("active")) is not bool:
-            raise ControlPlaneError
+            raise ResponseSchemaError
         ttl = payload.get("cache_ttl_seconds")
         if type(ttl) is not int or not 0 <= ttl <= 30:
-            raise ControlPlaneError
+            raise ResponseSchemaError
         if not payload["active"]:
             if ttl != 0:
-                raise ControlPlaneError
+                raise ResponseSchemaError
             return None
         key_id = payload.get("key_id")
         scopes = payload.get("scopes")
         expires_at = payload.get("expires_at")
         if type(key_id) is not str or type(scopes) is not list:
-            raise ControlPlaneError
+            raise ResponseSchemaError
         try:
             if str(uuid.UUID(key_id)) != key_id:
                 raise ValueError
         except ValueError as exc:
-            raise ControlPlaneError from exc
+            raise ResponseSchemaError from exc
         if (
             not scopes
             or any(type(scope) is not str for scope in scopes)
             or SCOPE not in scopes
         ):
-            raise ControlPlaneError
+            raise ResponseSchemaError
         if expires_at is not None:
             if type(expires_at) is not str:
-                raise ControlPlaneError
+                raise ResponseSchemaError
             try:
                 expiry = datetime.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ").replace(
                     tzinfo=timezone.utc
                 )
             except ValueError as exc:
-                raise ControlPlaneError from exc
+                raise ResponseSchemaError from exc
             remaining = int((expiry - datetime.now(timezone.utc)).total_seconds())
             if remaining <= 0:
-                raise ControlPlaneError
+                raise ResponseSchemaError
             ttl = min(ttl, remaining)
         rate_limit = ControlPlane._validate_rate_limit(payload)
         return KeyAccess(key_id, min(ttl, cache_max_ttl), rate_limit)
 
     @staticmethod
     def _validate_rate_limit(payload: dict[str, Any]) -> RateLimit | None:
-        if "rate_limits" not in payload:
+        if "rate_limit" not in payload:
             return None
-        policies = payload["rate_limits"]
-        if type(policies) is not dict or not policies:
-            raise ControlPlaneError
-        if "predict" not in policies:
-            return None
-        policy = policies["predict"]
+        policy = payload["rate_limit"]
         if type(policy) is not dict or set(policy) != {"requests", "window_seconds"}:
-            raise ControlPlaneError
+            raise ResponseSchemaError
         requests = policy["requests"]
         window = policy["window_seconds"]
-        if type(requests) is not int or not 0 <= requests <= 10_000 or window != 60:
-            raise ControlPlaneError
+        if (
+            type(requests) is not int
+            or not 0 <= requests <= 10_000
+            or type(window) is not int
+            or window != 60
+        ):
+            raise ResponseSchemaError
         return RateLimit(requests, window)
 
     @staticmethod
@@ -446,7 +485,12 @@ class ControlPlane:
         enforcement = self.enforcement
         policy = access.rate_limit
         if enforcement and policy is None:
-            raise ControlPlaneError
+            logger.warning(
+                "rate_limit_policy_missing: enforcement active but introspection "
+                "returned no per-key policy; failing closed for key_id=%s",
+                access.key_id,
+            )
+            raise RateLimitPolicyMissing
         now = int(time.time())
         global_window = now // self._window_seconds
         with self._limiter_lock:
@@ -663,6 +707,10 @@ class ControlPlane:
         self._last_failure_log = now
         logger.warning("usage flush failed; category=%s", category)
 
+    def _log_permanent_rejection(self, batch: dict[str, Any]) -> None:
+        record_count = len(batch.get("records", []))
+        logger.warning("usage batch permanently rejected; records=%s", record_count)
+
     async def _delayed_flush_worker(self, request_id: str) -> UsageFlushOutcome:
         await asyncio.sleep(self._usage_retry_delay_seconds)
         return await self._flush_worker(request_id)
@@ -754,6 +802,11 @@ class ControlPlane:
                             self._acknowledge_batch(batch)
                             self._next_flush_allowed = 0.0
                             return UsageFlushOutcome.ACCEPTED
+                        with self._usage_lock:
+                            self.usage_failure_counts["response_schema"] = min(
+                                self.usage_failure_counts["response_schema"] + 1,
+                                MAX_COUNTER,
+                            )
                         failure = "response_schema"
                     elif status in {401, 403}:
                         with self._usage_lock:
@@ -768,6 +821,7 @@ class ControlPlane:
                     elif status == 429 or status >= 500:
                         failure = "retryable_status"
                     elif 400 <= status < 500:
+                        self._log_permanent_rejection(batch)
                         self._dead_letter_batch(batch, "permanent_payload")
                         return UsageFlushOutcome.DEAD_LETTERED
                     else:

@@ -249,7 +249,7 @@ def create_app(control_plane: ControlPlane | None = None) -> FastAPI:
             raise error(401, "unauthorized", "x-api-key tidak valid.")
         try:
             access = await application.state.control_plane.introspect(
-                raw_key, request.state.request_id
+                raw_key, request.state.request_id, "POST", "/predict"
             )
         except ControlPlaneError:
             raise error(
