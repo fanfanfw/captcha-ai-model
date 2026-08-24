@@ -341,7 +341,7 @@ def test_introspection_cache_isolated_by_route(service):
     "change",
     [
         {"key_id": "bad"},
-        {"scopes": ["wrong"]},
+        {"scopes": [1]},
         {"expires_at": "bad"},
         {"cache_ttl_seconds": 31},
         {"rate_limit": {}},

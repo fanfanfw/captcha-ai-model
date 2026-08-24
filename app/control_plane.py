@@ -421,11 +421,7 @@ class ControlPlane:
                 raise ValueError
         except ValueError as exc:
             raise ResponseSchemaError from exc
-        if (
-            not scopes
-            or any(type(scope) is not str for scope in scopes)
-            or SCOPE not in scopes
-        ):
+        if any(type(scope) is not str for scope in scopes):
             raise ResponseSchemaError
         if expires_at is not None:
             if type(expires_at) is not str:
